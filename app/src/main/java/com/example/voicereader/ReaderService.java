@@ -28,6 +28,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
     public static final String RESUME="reader.RESUME";
     public static final String STOP="reader.STOP";
     public static final String SPEAK="reader.SPEAK";
+    public static final String CONFIG="reader.CONFIG";
 
     private static final int NOTIFY=71;
     private static final String CHANNEL="reader";
@@ -66,6 +67,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
 
     private final Map<String,String> lastSpoken=
             new ConcurrentHashMap<>();
+    private final Queue<String> pendingTexts=new ConcurrentLinkedQueue<>();
 
     @Override
     public void onCreate() {
@@ -73,9 +75,9 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
 
         createChannel();
 
-        tts=new TextToSpeech(this,this);
-
         worker=Executors.newSingleThreadExecutor();
+
+        tts=new TextToSpeech(this,this);
 
         PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
 
@@ -115,7 +117,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
             edgeVoice=i.getStringExtra("edge_voice");
             if(edgeVoice==null) edgeVoice="zh-CN-XiaoxiaoNeural";
 
-            edgeMode=i.getBooleanExtra("edge_mode",false);
+            edgeMode=false;
             networkVoiceMode=i.getBooleanExtra("network_voice",false);
             localVoiceName=i.getStringExtra("local_voice_name");
             if(localVoiceName==null) localVoiceName="";
@@ -132,11 +134,6 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
                     Math.min(3f,i.getFloatExtra("gain",2f))
             );
 
-            if(edgeMode && (serverUrl.isEmpty() || apiKey.isEmpty())) {
-                update("在线语音缺少服务器地址或密钥");
-                stopSelf();
-                return START_NOT_STICKY;
-            }
 
             running=true;
             paused=false;
@@ -150,6 +147,17 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
             } catch(Exception ignored) {}
 
             beginSchedule();
+
+        } else if(CONFIG.equals(action)) {
+
+            edgeMode=false;
+            networkVoiceMode=i.getBooleanExtra("network_voice",false);
+            localVoiceName=i.getStringExtra("local_voice_name");
+            if(localVoiceName==null) localVoiceName="";
+            speed=Math.max(0.5f,Math.min(1.5f,i.getFloatExtra("speed",1f)));
+            gain=Math.max(0.5f,Math.min(3f,i.getFloatExtra("gain",2f)));
+            if(running) update(networkVoiceMode?"已切换为本机联网语音包":"已切换为本机离线语音包");
+            else stopSelfResult(startId);
 
         } else if(PAUSE.equals(action)) {
 
@@ -180,6 +188,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
             }
 
             update("继续监控");
+            if(worker!=null) worker.execute(()->drainPendingTexts());
             submitCheck();
 
         } else if(STOP.equals(action)) {
@@ -188,44 +197,38 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
 
         } else if(SPEAK.equals(action)) {
 
-    serverUrl=i.getStringExtra("server_url");
-    if(serverUrl==null) serverUrl="";
+            edgeMode=false;
+            networkVoiceMode=i.getBooleanExtra("network_voice",false);
+            localVoiceName=i.getStringExtra("local_voice_name");
+            if(localVoiceName==null) localVoiceName="";
+            speed=Math.max(0.5f,Math.min(1.5f,i.getFloatExtra("speed",1f)));
+            gain=Math.max(0.5f,Math.min(3f,i.getFloatExtra("gain",2f)));
 
-    apiKey=i.getStringExtra("api_key");
-    if(apiKey==null) apiKey="";
-
-    edgeVoice=i.getStringExtra("edge_voice");
-    if(edgeVoice==null) edgeVoice="zh-CN-XiaoxiaoNeural";
-
-    edgeMode=i.getBooleanExtra("edge_mode",false);
-    networkVoiceMode=i.getBooleanExtra("network_voice",false);
-    localVoiceName=i.getStringExtra("local_voice_name");
-    if(localVoiceName==null) localVoiceName="";
-
-    speed=i.getFloatExtra("speed",1f);
-
-    gain=Math.max(
-            0.5f,
-            Math.min(3f,i.getFloatExtra("gain",2f))
-    );
-
-    String text=i.getStringExtra("text");
-
-        if(text!=null && !text.trim().isEmpty()) {
-
-           if(!running) {
-             running=true;
-             startForeground(NOTIFY,notification("正在朗读"));
-           }
-  
-             final String content=text.trim();
-
-           if(worker!=null) {
-             worker.execute(()->speak(content));
-           }
+            String text=i.getStringExtra("text");
+            if(text!=null && !text.trim().isEmpty()) {
+                if(!running) {
+                    running=true;
+                    paused=false;
+                    startForeground(NOTIFY,notification("正在准备朗读"));
+                }
+                String content=text.trim();
+                if(ready && worker!=null) {
+                    worker.execute(()->speak(content));
+                } else {
+                    pendingTexts.offer(content);
+                    update("语音引擎正在初始化，测试文字已排队等待播放");
+                }
+            }
         }
-    }
         return START_NOT_STICKY;
+    }
+
+    private void drainPendingTexts() {
+        if(!ready || !running || paused || worker==null) return;
+        String queued;
+        while(ready && running && !paused && (queued=pendingTexts.poll())!=null) {
+            speak(queued);
+        }
     }
 
     private void beginSchedule() {
@@ -526,7 +529,11 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
                     chosen=networkVoiceMode?findBestNetworkChineseVoice():findBestOfflineChineseVoice();
                 }
                 if(chosen!=null) {
-                    tts.setVoice(chosen);
+                    int voiceResult=tts.setVoice(chosen);
+                    if(voiceResult==TextToSpeech.ERROR) {
+                        update("系统语音引擎无法启用已确定的音色："+chosen.getName());
+                        return false;
+                    }
                 } else if(networkVoiceMode) {
                     update("手机 TTS 没有可用的联网中文音色，请安装/下载中文语音数据");
                     return false;
@@ -547,7 +554,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
             String id="local_"+System.currentTimeMillis();
             Bundle params=new Bundle();
             // 旧代码设置为 0，导致本机监控虽然提交朗读但完全静音。
-            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME,1.0f);
+            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME,Math.min(1.0f,gain));
             int result=tts.speak(text,TextToSpeech.QUEUE_FLUSH,params,id);
             if(result==TextToSpeech.ERROR) {
                 update("本机 TTS 拒绝播放，检查系统语音引擎和语音数据");
@@ -920,7 +927,8 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
         ready=(result==TextToSpeech.SUCCESS);
 
         if(!ready) {
-            update("本机 TTS 初始化失败");
+            pendingTexts.clear();
+            update("本机 TTS 初始化失败，请检查手机默认文字转语音引擎");
             return;
         }
 
@@ -963,6 +971,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
             );
 
             update("后台语音已就绪");
+            if(worker!=null) worker.execute(()->drainPendingTexts());
 
         } catch(Exception e) {
             update("TTS 配置失败："+err(e));
@@ -1138,6 +1147,7 @@ public class ReaderService extends Service implements TextToSpeech.OnInitListene
     public void onDestroy() {
 
         running=false;
+        pendingTexts.clear();
 
         if(scheduler!=null) scheduler.shutdownNow();
 
