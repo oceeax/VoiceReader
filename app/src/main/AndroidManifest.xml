@@ -15,7 +15,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="智能朗读器（本机/在线）"
+        android:label="文件智能朗读器（离线/联网）"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="true">
 
