@@ -13,23 +13,22 @@ import android.widget.*;
 import android.database.Cursor;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
+import android.provider.Settings;
 import android.text.InputType;
 
-import org.json.JSONObject;
 
 import java.io.*;
-import java.net.*;
 import java.util.*;
-import java.util.concurrent.*;
 
 public class MainActivity extends Activity {
 
     static final int PICK_TREE=101, PICK_FILE=102, REQ_NOTIFY=103;
 
     TextView status,selected,engineInfo,gainLabel;
-    EditText interval,webUrl,serverUrl,apiKey;
+    EditText interval,webUrl;
     CheckBox monitorLocalBox,monitorWebBox;
-    Spinner voice,rate,mode,edgeVoice;
+    Spinner offlineVoice,onlineVoice,rate;
+    TextView voiceStatus;
     SeekBar gainBar;
 
     String confirmedWebUrl="";
@@ -37,10 +36,11 @@ public class MainActivity extends Activity {
 
     TextToSpeech tts;
     boolean ttsReady=false;
-    boolean keyVerified=false;
 
-    final ArrayList<Voice> availableVoices=new ArrayList<>();
-    final ArrayList<String> voiceLabels=new ArrayList<>();
+    final ArrayList<Voice> offlineVoices=new ArrayList<>();
+    final ArrayList<Voice> onlineVoices=new ArrayList<>();
+    String activeVoiceName="";
+    boolean activeNetworkMode=false;
 
     final String[] rates={
         "0.5倍","0.75倍","1.0倍","1.25倍","1.5倍"
@@ -50,23 +50,6 @@ public class MainActivity extends Activity {
         0.5f,0.75f,1.0f,1.25f,1.5f
     };
 
-    final String[] edgeVoiceNames={
-        "晓晓（女声）",
-        "云扬（男声）",
-        "晓伊（女声）",
-        "云希（男声）"
-    };
-
-    final String[] edgeVoiceIds={
-        "zh-CN-XiaoxiaoNeural",
-        "zh-CN-YunyangNeural",
-        "zh-CN-XiaoyiNeural",
-        "zh-CN-YunxiNeural"
-    };
-
-    final ExecutorService netExecutor=
-            Executors.newSingleThreadExecutor();
-
     SharedPreferences prefs;
 
     @Override
@@ -75,13 +58,8 @@ public class MainActivity extends Activity {
 
         prefs=getSharedPreferences("reader",0);
 
-        // 旧版本的模式编号：1 代表 Edge 在线；新版编号改为 2。
-        if(!prefs.getBoolean("mode_v2_migrated",false)) {
-            int oldMode=prefs.getInt("mode",0);
-            SharedPreferences.Editor edit=prefs.edit().putBoolean("mode_v2_migrated",true);
-            if(oldMode==1) edit.putInt("mode",2);
-            edit.apply();
-        }
+        activeVoiceName=prefs.getString("active_voice_name","");
+        activeNetworkMode=prefs.getBoolean("active_network_mode",false);
 
         treeUri=readUri("tree");
         fileUri=readUri("file");
@@ -94,24 +72,10 @@ public class MainActivity extends Activity {
 
         webUrl.setText(confirmedWebUrl);
 
-        serverUrl.setText(
-                prefs.getString(
-                        "server_url",
-                        "http://170.106.188.189:6363"
-                )
-        );
-
-        apiKey.setText(
-                prefs.getString("api_key","")
-        );
-
-        keyVerified=prefs.getBoolean("key_verified",false);
-
         requestNotificationPermission();
 
         initTTS();
 
-        updateKeyStatus();
     }
 
     void buildUi() {
@@ -167,103 +131,48 @@ public class MainActivity extends Activity {
 
         addDivider(root);
 
-        TextView serverTitle=new TextView(this);
-        serverTitle.setText("Edge TTS 在线语音服务器");
-        serverTitle.setTextSize(19);
-        root.addView(serverTitle);
+        TextView voiceTitle=new TextView(this);
+        voiceTitle.setText("语音包选择（选择后必须点击对应确定按钮）");
+        voiceTitle.setTextSize(19);
+        root.addView(voiceTitle);
 
-        TextView serverLabel=new TextView(this);
-        serverLabel.setText("服务器地址");
-        root.addView(serverLabel);
+        TextView offlineLabel=new TextView(this);
+        offlineLabel.setText("① 本机离线中文语音包（不需要网络）");
+        root.addView(offlineLabel);
 
-        serverUrl=new EditText(this);
-        serverUrl.setSingleLine(true);
-        serverUrl.setInputType(
-                InputType.TYPE_CLASS_TEXT |
-                InputType.TYPE_TEXT_VARIATION_URI
-        );
-        serverUrl.setHint("http://服务器IP:6363");
-        root.addView(serverUrl);
+        offlineVoice=new Spinner(this);
+        offlineVoice.setAdapter(new ArrayAdapter<>(
+                this,android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"正在读取本机离线语音包…"}
+        ));
+        root.addView(offlineVoice);
+        addButton(root,"确定使用本机离线语音包",v->confirmOfflineVoice());
 
-        TextView keyLabel=new TextView(this);
-        keyLabel.setText("API 密钥");
-        root.addView(keyLabel);
+        TextView onlineLabel=new TextView(this);
+        onlineLabel.setText("② 本机联网中文语音包（需要网络）");
+        root.addView(onlineLabel);
 
-        apiKey=new EditText(this);
-        apiKey.setSingleLine(true);
-        apiKey.setInputType(
-                InputType.TYPE_CLASS_TEXT |
-                InputType.TYPE_TEXT_VARIATION_PASSWORD
-        );
-        apiKey.setHint("输入服务器 API 密钥");
-        root.addView(apiKey);
+        onlineVoice=new Spinner(this);
+        onlineVoice.setAdapter(new ArrayAdapter<>(
+                this,android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"正在读取本机联网语音包…"}
+        ));
+        root.addView(onlineVoice);
+        addButton(root,"确定使用本机联网语音包",v->confirmOnlineVoice());
 
-        addButton(root,"验证并保存服务器密钥",v->verifyServerKey());
-
-        addButton(root,"清除已保存的密钥",v->clearKey());
+        voiceStatus=new TextView(this);
+        voiceStatus.setPadding(0,10,0,8);
+        voiceStatus.setText("当前已确定：尚未选择语音包");
+        root.addView(voiceStatus);
 
         engineInfo=new TextView(this);
-        engineInfo.setPadding(0,10,0,8);
-        engineInfo.setText("服务器状态：尚未验证");
+        engineInfo.setPadding(0,6,0,8);
+        engineInfo.setText("本机语音引擎：正在初始化");
         root.addView(engineInfo);
 
-        addDivider(root);
-
-        TextView modeLabel=new TextView(this);
-        modeLabel.setText("朗读模式");
-        root.addView(modeLabel);
-
-        mode=new Spinner(this);
-
-        mode.setAdapter(new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_dropdown_item,
-                new String[]{
-                        "本机离线语音（无需网络）",
-                        "本机联网语音（使用手机 TTS）",
-                        "Edge TTS 在线语音（使用服务器）"
-                }
-        ));
-
-        mode.setSelection(
-                prefs.getInt("mode",0)
-        );
-
-        root.addView(mode);
-
-        TextView edgeLabel=new TextView(this);
-        edgeLabel.setText("Edge TTS 在线音色");
-        root.addView(edgeLabel);
-
-        edgeVoice=new Spinner(this);
-
-        edgeVoice.setAdapter(new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_dropdown_item,
-                edgeVoiceNames
-        ));
-
-        edgeVoice.setSelection(
-                prefs.getInt("edge_voice_index",0)
-        );
-
-        root.addView(edgeVoice);
-
-        TextView localLabel=new TextView(this);
-        localLabel.setText("本机中文语音音色");
-        root.addView(localLabel);
-
-        voice=new Spinner(this);
-
-        voice.setAdapter(new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_dropdown_item,
-                new String[]{"系统默认（初始化中）"}
-        ));
-
-        root.addView(voice);
-
-        addButton(root,"测试当前选择的语音",v->testSpeech());
+        addButton(root,"测试当前已确定的语音",v->testSpeech());
+        addButton(root,"打开系统文字转语音设置（下载/安装语音包）",v->openTtsSettings());
+        addButton(root,"重新读取语音包列表",v->{ if(ttsReady) loadChineseVoices(); });
 
         addDivider(root);
 
@@ -343,54 +252,32 @@ public class MainActivity extends Activity {
         TextView note=new TextView(this);
 
         note.setText(
-                "说明：本机目录和网页地址可以同时监控。" +
-                "Edge TTS 需要先验证服务器密钥。" +
-                "本机离线语音无需网络；本机联网语音使用手机 TTS 引擎的联网音色；Edge TTS 使用已验证的服务器。" +
-                "本机监控和网页监控可同时开启，三种朗读模式可随时切换。" +
-                "网页暂不支持需要登录、Cookie、验证码或 JavaScript 动态加载的页面。"
+                "说明：只有点击对应的确定按钮，语音包才会生效。" +
+                "测试朗读、手动朗读和定时监控统一使用当前已确定的语音包。" +
+                "本机离线语音不需要网络；本机联网语音需要网络和系统语音引擎支持。请同时调高手机媒体音量。" +
+                "本机目录和网页地址可以同时监控。网页暂不支持需要登录、Cookie、验证码或 JavaScript 动态加载的页面。"
         );
 
         root.addView(note);
 
         setContentView(scroll);
 
-        mode.setOnItemSelectedListener(
-                new AdapterView.OnItemSelectedListener() {
+    }
 
-            @Override
-            public void onItemSelected(
-                    AdapterView<?> parent,View view,int position,long id
-            ) {
-                prefs.edit().putInt("mode",position).apply();
+    void openTtsSettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_TTS_SETTINGS));
+        } catch(Exception e) {
+            status.setText("无法打开系统 TTS 设置，请到系统设置中搜索‘文字转语音’");
+        }
+    }
 
-                if(position==2 && !keyVerified) {
-                    status.setText("请先验证 Edge TTS 服务器密钥");
-                } else if(position==1) {
-                    status.setText("已选择本机联网语音；需要手机 TTS 引擎提供联网中文音色");
-                } else if(position==0) {
-                    status.setText("已选择本机离线语音；无需网络");
-                }
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
-
-        edgeVoice.setOnItemSelectedListener(
-                new AdapterView.OnItemSelectedListener() {
-
-            @Override
-            public void onItemSelected(
-                    AdapterView<?> parent,View view,int position,long id
-            ) {
-                prefs.edit()
-                        .putInt("edge_voice_index",position)
-                        .apply();
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if(ttsReady && offlineVoice!=null && onlineVoice!=null) {
+            loadChineseVoices();
+        }
     }
 
     void addDivider(LinearLayout root) {
@@ -417,163 +304,6 @@ public class MainActivity extends Activity {
         b.setOnClickListener(listener);
     }
 
-    void updateKeyStatus() {
-        if(engineInfo==null) return;
-
-        engineInfo.setText(
-                keyVerified
-                ?"服务器状态：密钥验证成功"
-                :"服务器状态：尚未验证"
-        );
-    }
-
-    void verifyServerKey() {
-
-        String base=serverUrl.getText().toString().trim();
-        String key=apiKey.getText().toString().trim();
-
-        if(!(base.startsWith("http://") ||
-             base.startsWith("https://"))) {
-
-            status.setText("服务器地址必须以 http:// 或 https:// 开头");
-            return;
-        }
-
-        if(key.isEmpty()) {
-            status.setText("请先输入 API 密钥");
-            return;
-        }
-
-        status.setText("正在连接服务器验证密钥……");
-
-        netExecutor.execute(()->{
-
-            HttpURLConnection conn=null;
-
-            try {
-
-                String endpoint=base.replaceAll("/+$","")+
-                        "/auth/check";
-
-                conn=(HttpURLConnection)new URL(endpoint)
-                        .openConnection();
-
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(10000);
-                conn.setReadTimeout(10000);
-
-                conn.setRequestProperty(
-                        "Authorization","Bearer "+key
-                );
-
-                int code=conn.getResponseCode();
-
-                InputStream in=code>=200 && code<300
-                        ?conn.getInputStream()
-                        :conn.getErrorStream();
-
-                StringBuilder response=new StringBuilder();
-
-                if(in!=null) {
-                    try(BufferedReader r=new BufferedReader(
-                            new InputStreamReader(in,"UTF-8")
-                    )) {
-                        String line;
-                        while((line=r.readLine())!=null) {
-                            response.append(line);
-                        }
-                    }
-                }
-
-                JSONObject json=new JSONObject(
-                        response.toString()
-                );
-
-                boolean valid=
-                        code==200 &&
-                        json.optBoolean("valid",false);
-
-                runOnUiThread(()->{
-
-                    if(valid) {
-
-                        keyVerified=true;
-
-                        prefs.edit()
-                                .putString("server_url",base)
-                                .putString("api_key",key)
-                                .putBoolean("key_verified",true)
-                                .apply();
-
-                        updateKeyStatus();
-
-                        status.setText(
-                                "验证成功，Edge TTS 在线语音已解锁"
-                        );
-
-                    } else {
-
-                        keyVerified=false;
-
-                        prefs.edit()
-                                .putBoolean("key_verified",false)
-                                .apply();
-
-                        updateKeyStatus();
-
-                        status.setText(
-                                "密钥验证失败，HTTP "+code
-                        );
-                    }
-                });
-
-            } catch(Exception e) {
-
-                runOnUiThread(()->{
-                    keyVerified=false;
-
-                    prefs.edit()
-                            .putBoolean("key_verified",false)
-                            .apply();
-
-                    updateKeyStatus();
-
-                    status.setText(
-                            "连接验证失败："+e.getMessage()
-                    );
-                });
-
-            } finally {
-
-                if(conn!=null) conn.disconnect();
-            }
-        });
-    }
-
-    void clearKey() {
-
-        keyVerified=false;
-
-        apiKey.setText("");
-
-        prefs.edit()
-                .remove("api_key")
-                .putBoolean("key_verified",false)
-                .apply();
-
-        updateKeyStatus();
-
-        status.setText("已清除密钥，需要重新验证才能使用在线语音");
-    }
-
-    String selectedServer() {
-        return serverUrl.getText().toString().trim();
-    }
-
-    String selectedKey() {
-        return apiKey.getText().toString().trim();
-    }
-
     int selectedRatePosition() {
         int p=rate.getSelectedItemPosition();
 
@@ -582,28 +312,55 @@ public class MainActivity extends Activity {
         return p;
     }
 
-    String selectedEdgeVoice() {
-        int p=edgeVoice.getSelectedItemPosition();
-
-        if(p<0 || p>=edgeVoiceIds.length) p=0;
-
-        return edgeVoiceIds[p];
-    }
-
-    boolean isEdgeMode() {
-        return mode.getSelectedItemPosition()==2;
-    }
-
-    boolean isNetworkLocalMode() {
-        return mode.getSelectedItemPosition()==1;
-    }
-
-    String selectedLocalVoiceName() {
-        int p=voice==null?0:voice.getSelectedItemPosition();
-        if(p>0 && p-1<availableVoices.size()) {
-            return availableVoices.get(p-1).getName();
+    void restoreVoiceSelection(Spinner spinner,ArrayList<Voice> list,String name) {
+        if(spinner==null || list.isEmpty() || name==null || name.isEmpty()) return;
+        for(int i=0;i<list.size();i++) {
+            if(name.equals(list.get(i).getName())) {
+                spinner.setSelection(i);
+                return;
+            }
         }
-        return "";
+    }
+
+    void confirmOfflineVoice() {
+        int p=offlineVoice==null?-1:offlineVoice.getSelectedItemPosition();
+        if(p<0 || p>=offlineVoices.size()) {
+            status.setText("没有可确定的本机离线中文语音包。请先在手机系统 TTS 设置中下载离线中文语音。");
+            return;
+        }
+        Voice v=offlineVoices.get(p);
+        activeVoiceName=v.getName();
+        activeNetworkMode=false;
+        prefs.edit().putString("active_voice_name",activeVoiceName)
+                .putString("offline_voice_name",activeVoiceName)
+                .putBoolean("active_network_mode",false).apply();
+        voiceStatus.setText("当前已确定：本机离线语音包\n"+v.getName());
+        updateRunningServiceVoice();
+        status.setText("已确定本机离线语音包，可以测试或开始监控");
+    }
+
+    void confirmOnlineVoice() {
+        int p=onlineVoice==null?-1:onlineVoice.getSelectedItemPosition();
+        if(p<0 || p>=onlineVoices.size()) {
+            status.setText("没有可确定的本机联网中文语音包。请检查系统 TTS 引擎及联网中文音色。");
+            return;
+        }
+        Voice v=onlineVoices.get(p);
+        activeVoiceName=v.getName();
+        activeNetworkMode=true;
+        prefs.edit().putString("active_voice_name",activeVoiceName)
+                .putString("online_voice_name",activeVoiceName)
+                .putBoolean("active_network_mode",true).apply();
+        voiceStatus.setText("当前已确定：本机联网语音包\n"+v.getName());
+        updateRunningServiceVoice();
+        status.setText("已确定本机联网语音包，可以测试或开始监控");
+    }
+
+    void updateRunningServiceVoice() {
+        Intent i=new Intent(this,ReaderService.class);
+        i.setAction(ReaderService.CONFIG);
+        putSpeechSettings(i);
+        startService(i);
     }
 
     void confirmWebUrl() {
@@ -680,166 +437,95 @@ public class MainActivity extends Activity {
     }
 
     void loadChineseVoices() {
-
-        availableVoices.clear();
-        voiceLabels.clear();
-
-        voiceLabels.add("系统默认");
-
+        offlineVoices.clear();
+        onlineVoices.clear();
         try {
-
-            Set<Voice> all=tts.getVoices();
-
-            if(all!=null) {
-
-                for(Voice v:all) {
-
-                    Locale l=v.getLocale();
-
-                    if(l!=null &&
-                            "zh".equalsIgnoreCase(l.getLanguage())) {
-
-                        availableVoices.add(v);
-
-                        voiceLabels.add(
-                                (v.isNetworkConnectionRequired()
-                                ?"[联网] ":"[离线] ")+
-                                l.getDisplayName()+" · "+v.getName()
-                        );
+            if(Build.VERSION.SDK_INT>=21) {
+                Set<Voice> all=tts.getVoices();
+                if(all!=null) {
+                    for(Voice v:all) {
+                        Locale l=v.getLocale();
+                        if(l==null || !"zh".equalsIgnoreCase(l.getLanguage())) continue;
+                        if(v.isNetworkConnectionRequired()) onlineVoices.add(v);
+                        else offlineVoices.add(v);
                     }
                 }
             }
-
-        } catch(Exception ignored) {}
-
-        voice.setAdapter(new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_dropdown_item,
-                voiceLabels
-        ));
+        } catch(Exception e) {
+            status.setText("读取系统语音包失败："+e.getMessage());
+        }
+        Comparator<Voice> byQuality=(a,b)->Integer.compare(b.getQuality(),a.getQuality());
+        Collections.sort(offlineVoices,byQuality);
+        Collections.sort(onlineVoices,byQuality);
+        setVoiceAdapter(offlineVoice,offlineVoices,"没有可用的离线中文语音包");
+        setVoiceAdapter(onlineVoice,onlineVoices,"没有可用的联网中文语音包");
+        restoreVoiceSelection(offlineVoice,offlineVoices,prefs.getString("offline_voice_name",""));
+        restoreVoiceSelection(onlineVoice,onlineVoices,prefs.getString("online_voice_name",""));
+        ArrayList<Voice> activeList=activeNetworkMode?onlineVoices:offlineVoices;
+        boolean activeFound=false;
+        for(Voice v:activeList) {
+            if(activeVoiceName!=null && activeVoiceName.equals(v.getName())) {
+                activeFound=true;
+                break;
+            }
+        }
+        if(!activeFound && activeVoiceName!=null && !activeVoiceName.isEmpty()) {
+            activeVoiceName="";
+            prefs.edit().remove("active_voice_name").apply();
+        }
+        restoreVoiceSelection(activeNetworkMode?onlineVoice:offlineVoice,
+                activeList,activeVoiceName);
+        if(activeVoiceName.isEmpty()) {
+            voiceStatus.setText("当前已确定：尚未选择语音包，请点击其中一个确定按钮");
+        } else {
+            voiceStatus.setText("当前已确定："+(activeNetworkMode?"本机联网语音包":"本机离线语音包")+"\n"+activeVoiceName);
+        }
+        engineInfo.setText("本机语音引擎："+(tts.getDefaultEngine()==null?"系统默认":tts.getDefaultEngine())+
+                "\n离线中文包："+offlineVoices.size()+" 个；联网中文包："+onlineVoices.size()+" 个");
     }
 
-    void applySelectedVoice() {
-
-        if(tts==null) return;
-
-        int p=voice.getSelectedItemPosition();
-
-        try {
-            boolean wantNetwork=isNetworkLocalMode();
-            Voice chosen=null;
-
-            if(p>0 && p-1<availableVoices.size()) {
-                Voice selected=availableVoices.get(p-1);
-                if(selected.isNetworkConnectionRequired()==wantNetwork) chosen=selected;
-            }
-
-            if(chosen==null) {
-                for(Voice candidate:availableVoices) {
-                    if(candidate.isNetworkConnectionRequired()==wantNetwork &&
-                            (chosen==null || candidate.getQuality()>chosen.getQuality())) {
-                        chosen=candidate;
-                    }
-                }
-            }
-
-            if(chosen!=null) tts.setVoice(chosen);
-            else tts.setLanguage(Locale.forLanguageTag("zh-CN"));
-
-        } catch(Exception ignored) {}
+    void setVoiceAdapter(Spinner spinner,ArrayList<Voice> list,String emptyLabel) {
+        ArrayList<String> labels=new ArrayList<>();
+        for(Voice v:list) {
+            Locale l=v.getLocale();
+            labels.add((l==null?"中文":l.getDisplayName())+" · "+v.getName());
+        }
+        if(labels.isEmpty()) labels.add(emptyLabel);
+        spinner.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item,labels));
     }
 
     void testSpeech() {
-        String sample="你好，现在正在测试当前选择的中文语音，一二三四五。";
-
-        if(isEdgeMode() && !keyVerified) {
-            status.setText("请先验证服务器密钥");
+        if(activeVoiceName==null || activeVoiceName.isEmpty()) {
+            status.setText("请先选择语音包，并点击对应的确定按钮");
             return;
         }
-
-        // 测试也走后台服务，确保测试路径与自动监控的实际朗读路径一致。
-        speakThroughService(sample);
+        speakThroughService("你好，现在正在测试当前已确定的中文语音，一二三四五。");
     }
 
     void speakText(String text) {
-
-        if(isEdgeMode()) {
-
-            if(!keyVerified) {
-                status.setText("请先验证服务器密钥");
-                return;
-            }
-
-            speakThroughService(text);
+        if(activeVoiceName==null || activeVoiceName.isEmpty()) {
+            status.setText("请先选择语音包，并点击对应的确定按钮");
             return;
         }
-
-        if(tts==null || !ttsReady) {
-            status.setText("本机语音引擎尚未初始化");
-            return;
-        }
-
-        try {
-
-            applySelectedVoice();
-
-            tts.setSpeechRate(
-                    speedValues[selectedRatePosition()]
-            );
-
-            int r=tts.speak(
-                    text,
-                    TextToSpeech.QUEUE_FLUSH,
-                    null,
-                    "manual_"+System.currentTimeMillis()
-            );
-
-            status.setText(
-                    r==TextToSpeech.ERROR
-                    ?"本机 TTS 拒绝播放"
-                    :"已提交本机语音播放"
-            );
-
-        } catch(Exception e) {
-            status.setText("播放异常："+e.getMessage());
-        }
+        speakThroughService(text);
     }
 
     void speakThroughService(String text) {
-
         Intent i=new Intent(this,ReaderService.class);
-
         i.setAction(ReaderService.SPEAK);
-
         i.putExtra("text",text);
-
         putSpeechSettings(i);
-
         startReaderService(i);
-
-        status.setText(isEdgeMode()?"已提交 Edge TTS 服务器在线朗读":
-                (isNetworkLocalMode()?"已提交手机本机联网 TTS 朗读":"已提交手机本机离线 TTS 朗读"));
+        status.setText(activeNetworkMode?"已提交本机联网语音朗读":"已提交本机离线语音朗读");
     }
 
     void putSpeechSettings(Intent i) {
-
-        i.putExtra("server_url",selectedServer());
-        i.putExtra("api_key",selectedKey());
-
-        i.putExtra("edge_mode",isEdgeMode());
-        i.putExtra("network_voice",isNetworkLocalMode());
-        i.putExtra("local_voice_name",selectedLocalVoiceName());
-        i.putExtra("edge_voice",selectedEdgeVoice());
-
-        i.putExtra(
-                "speed",
-                speedValues[selectedRatePosition()]
-        );
-
-        i.putExtra(
-                "gain",
-                (50+gainBar.getProgress())/100f
-        );
+        i.putExtra("edge_mode",false);
+        i.putExtra("network_voice",activeNetworkMode);
+        i.putExtra("local_voice_name",activeVoiceName==null?"":activeVoiceName);
+        i.putExtra("speed",speedValues[selectedRatePosition()]);
+        i.putExtra("gain",(50+gainBar.getProgress())/100f);
     }
 
     void startReaderService(Intent i) {
@@ -1137,8 +823,8 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if(isEdgeMode() && !keyVerified) {
-            status.setText("Edge TTS 尚未验证服务器密钥");
+        if(activeVoiceName==null || activeVoiceName.isEmpty()) {
+            status.setText("请先选择本机离线或联网语音包，并点击对应的确定按钮");
             return;
         }
 
@@ -1204,7 +890,6 @@ public class MainActivity extends Activity {
             tts.shutdown();
         }
 
-        netExecutor.shutdownNow();
 
         super.onDestroy();
     }
